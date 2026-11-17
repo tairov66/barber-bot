@@ -258,3 +258,155 @@ async def process_custom_time(message: types.Message, state: FSMContext):
         hour, minute = map(int, time_str.split(":"))
         if not (10 <= hour < 22 or (hour == 22 and minute == 0)):
             kb = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)]],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+            await message.answer(
+                "⚠️ Мы работаем с 10:00 до 22:00! Но не переживайте, оставьте свой номер, и мы свяжемся с вами завтра для уточнения записи 😊👍🏻",
+                reply_markup=kb
+            )
+            await state.set_state(Booking.night_phone)
+            return
+    except ValueError:
+        await message.answer("⚠️ Неверный формат времени! Напиши в формате ЧЧ:ММ (например: 14:30):")
+        return
+
+    data = await state.get_data()
+    
+    if time_str in get_booked_times(data["date"]):
+        await message.answer("⚠️ К сожалению, это время уже занято. Выбери другое:")
+        return
+
+    await state.update_data(time=time_str)
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer("Нажми кнопку ниже, чтобы отправить номер, или напиши его вручную:", reply_markup=kb)
+    await state.set_state(Booking.phone)
+
+@dp.callback_query(Booking.time, F.data.startswith("time_"))
+async def process_time(callback: types.CallbackQuery, state: FSMContext):
+    time_str = callback.data.split("_", 1)[1]
+    await state.update_data(time=time_str)
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await callback.message.answer("Нажми кнопку ниже, чтобы отправить номер, или напиши его вручную:", reply_markup=kb)
+    await state.set_state(Booking.phone)
+
+@dp.message(Booking.phone)
+async def process_phone(message: types.Message, state: FSMContext):
+    phone = message.contact.phone_number if message.contact else message.text
+    data = await state.get_data()
+    
+    if not data or "time" not in data or "date" not in data:
+        await message.answer("⚠️ Сессия устарела или произошла ошибка. Нажми /start для новой записи.", reply_markup=types.ReplyKeyboardRemove())
+        await state.clear()
+        return
+
+    if data["time"] in get_booked_times(data["date"]):
+        await message.answer("⚠️ Упс! Пока ты вводил номер, это время уже заняли. Нажми /start и выбери другое.", reply_markup=types.ReplyKeyboardRemove())
+        await state.clear()
+        return
+
+    user_name = message.from_user.first_name or "Клиент"
+    booking_id = add_booking(message.from_user.id, user_name, phone, data["service"], data["date"], data["time"])
+    
+    await message.answer(
+        f"✅ Запись отправлена на рассмотрение!\n\n"
+        f"✂️ Услуга: {data['service']} ({data['price']})\n"
+        f"📅 Дата: {data['date']}\n"
+        f"⏰ Время: {data['time']}\n"
+        f"📞 Телефон: {phone}\n\n"
+        f"Администратор скоро свяжется с вами или подтвердит запись.",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+    
+    if ADMIN_ID != 0:
+        user_link = f'<a href="tg://user?id={message.from_user.id}">{user_name}</a>'
+        admin_text = (
+            f"🔥 <b>Новая заявка на запись! (#ID {booking_id})</b>\n\n"
+            f"👤 Клиент: {user_link}\n"
+            f"📞 Телефон: <code>{phone}</code>\n"
+            f"✂️ Услуга: {data['service']}\n"
+            f"📅 Дата: {data['date']} в {data['time']}"
+        )
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm_ok_{booking_id}"),
+                InlineKeyboardButton(text="❌ Отменить", callback_data=f"adm_no_{booking_id}")
+            ]
+        ])
+        try:
+            await bot.send_message(ADMIN_ID, admin_text, reply_markup=admin_kb)
+        except Exception as e:
+            logging.error(f"Ошибка отправки админу: {e}")
+            
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("adm_"))
+async def admin_action(callback: types.CallbackQuery):
+    data_parts = callback.data.split("_")
+    action = data_parts[1]
+    booking_id = int(data_parts[2])
+    
+    booking = get_booking_by_id(booking_id)
+    if not booking:
+        await callback.answer("⚠️ Запись не найдена в базе!", show_alert=True)
+        return
+        
+    client_id, service, date_str, time_str, status = booking
+    
+    if action == "ok":
+        update_booking_status(booking_id, "confirmed")
+        try:
+            await callback.message.edit_text(
+                callback.message.text + "\n\n<b>✅ СТАТУС: Подтверждено администратором</b>"
+            )
+        except:
+            pass
+        try:
+            await bot.send_message(
+                client_id,
+                f"✅ Ваша запись на {date_str} в {time_str} ({service}) подтверждена администратором! Ждем вас в барбершопе 💈"
+            )
+        except:
+            pass
+        await callback.answer("Запись подтверждена!")
+        
+    elif action == "no":
+        update_booking_status(booking_id, "cancelled")
+        try:
+            await callback.message.edit_text(
+                callback.message.text + "\n\n<b>❌ СТАТУС: Отменено</b>"
+            )
+        except:
+            pass
+        try:
+            await bot.send_message(
+                client_id,
+                f"❌ К сожалению, ваша запись на {date_str} в {time_str} была отменена. Можете записаться на другое время через /start"
+            )
+        except:
+            pass
+        await callback.answer("Запись отменена, слот освобожден!")
+
+async def main():
+    init_db()
+    # Запускаем фоновый веб-сервер для Render и пуллинг бота одновременно
+    asyncio.create_task(web_server())
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
