@@ -1,14 +1,29 @@
 import os
 import sqlite3
 import logging
-from datetime import datetime, timedelta
+import asyncio
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from threading import Thread
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
-# Токен и настройки
+# Заглушка веб-сервера для Render, чтобы он не ругался на порты
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
+    server.serve_forever()
+
+# Запускаем веб-сервер в отдельном потоке
+Thread(target=run_web_server, daemon=True).start()
+
+# Токен и настройки бота
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 727996140
 
@@ -94,5 +109,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
