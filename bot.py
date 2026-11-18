@@ -1,4 +1,4 @@
-import os
+  import os
 import sqlite3
 import logging
 from datetime import datetime, timedelta
@@ -18,11 +18,10 @@ dp = Dispatcher()
 
 DB_NAME = "barber_base.db"
 
-# Инициализация базы данных (создаем обе таблицы)
+# Инициализация базы данных
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    # Таблица записей
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,7 +34,6 @@ def init_db():
             status TEXT DEFAULT 'confirmed'
         )
     """)
-    # Таблица пользователей
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -46,10 +44,19 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Главное меню с кнопками
+def get_main_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="💇‍♂️ Записаться"), KeyboardButton(text="📋 Мои записи")],
+            [KeyboardButton(text="📍 Адрес и контакты"), KeyboardButton(text="ℹ️ О нас")]
+        ],
+        resize_keyboard=True
+    )
+
 # Обработчик команды /start
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    # Сохраняем пользователя в базу при старте
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
@@ -58,11 +65,27 @@ async def cmd_start(message: types.Message):
     conn.close()
 
     await message.answer(
-        "Привет! Добро пожаловать в наш барбершоп. Выберите нужную услугу:",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="💇‍♂️ Записаться")]],
-            resize_keyboard=True
-        )
+        "👋 Привет! Добро пожаловать в наш барбершоп.\nВыберите нужный раздел в меню ниже:",
+        reply_markup=get_main_menu()
+    )
+
+# Обработчик кнопки «Адрес и контакты»
+@dp.message(F.text == "📍 Адрес и контакты")
+async def cmd_contacts(message: types.Message):
+    await message.answer(
+        "📍 **Наш адрес:** г. Ош\n"
+        "📞 **Телефон:** +996 (XX വിവ) XX-XX-XX\n"
+        "⏰ **Гражим работы:** Каждый день с 10:00 до 20:00",
+        reply_markup=get_main_menu(),
+        parse_mode="Markdown"
+    )
+
+# Обработчик кнопки «О нас»
+@dp.message(F.text == "ℹ️ О нас")
+async def cmd_about(message: types.Message):
+    await message.answer(
+        "✂️ Мы — лучший барбершоп в городе. Стильные стрижки, борода, качественный сервис и крутая атмосфера!",
+        reply_markup=get_main_menu()
     )
 
 # Запуск бота
