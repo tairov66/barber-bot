@@ -1,4 +1,4 @@
-  import os
+ import os
 import sqlite3
 import logging
 from datetime import datetime, timedelta
@@ -74,8 +74,8 @@ async def cmd_start(message: types.Message):
 async def cmd_contacts(message: types.Message):
     await message.answer(
         "📍 **Наш адрес:** г. Ош\n"
-        "📞 **Телефон:** +996 (XX വിവ) XX-XX-XX\n"
-        "⏰ **Гражим работы:** Каждый день с 10:00 до 20:00",
+        "📞 **Телефон:** +996 (XX) XX-XX-XX\n"
+        "⏰ **График работы:** Каждый день с 10:00 до 20:00",
         reply_markup=get_main_menu(),
         parse_mode="Markdown"
     )
