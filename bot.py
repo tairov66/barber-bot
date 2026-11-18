@@ -13,10 +13,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 
-# Часовой пояс Кыргызстана
 BISHKEK_TZ = pytz.timezone("Asia/Bishkek")
 
-# Заглушка веб-сервера для Render, чтобы хостинг видел открытый порт
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -30,7 +28,6 @@ def run_web_server():
 
 Thread(target=run_web_server, daemon=True).start()
 
-# Настройки бота
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 727996140
 
@@ -40,19 +37,15 @@ dp = Dispatcher()
 
 DB_NAME = "barber_base.db"
 
-# Состояния FSM для записи
 class BookingState(StatesGroup):
     waiting_for_service = State()
     waiting_for_date = State()
     waiting_for_time = State()
     waiting_for_phone = State()
 
-# Инициализация базы данных с поддержкой безопасного обновления структуры
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    
-    # Таблица пользователей
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -60,8 +53,6 @@ def init_db():
             full_name TEXT
         )
     """)
-    
-    # Таблица записей с расширенными полями
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,11 +65,9 @@ def init_db():
             status TEXT DEFAULT 'confirmed'
         )
     """)
-    
     conn.commit()
     conn.close()
 
-# Главное меню
 def get_main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -88,7 +77,6 @@ def get_main_menu():
         resize_keyboard=True
     )
 
-# Обработчик команды /start
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     conn = sqlite3.connect(DB_NAME)
@@ -105,7 +93,6 @@ async def cmd_start(message: types.Message):
         reply_markup=get_main_menu()
     )
 
-# Адрес и контакты
 @dp.message(F.text == "📍 Адрес и контакты")
 async def cmd_contacts(message: types.Message):
     await message.answer(
@@ -116,7 +103,6 @@ async def cmd_contacts(message: types.Message):
         parse_mode="Markdown"
     )
 
-# О нас
 @dp.message(F.text == "ℹ️ О нас")
 async def cmd_about(message: types.Message):
     await message.answer(
@@ -124,7 +110,6 @@ async def cmd_about(message: types.Message):
         reply_markup=get_main_menu()
     )
 
-# Мои записи с возможностью отмены
 @dp.message(F.text == "📋 Мои записи")
 async def cmd_my_bookings(message: types.Message):
     conn = sqlite3.connect(DB_NAME)
@@ -153,7 +138,6 @@ async def cmd_my_bookings(message: types.Message):
         ])
         await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
-# Обработка отмены записи клиентом
 @dp.callback_query(F.data.startswith("cancel_"))
 async def process_cancel(callback: types.CallbackQuery):
     booking_id = int(callback.data.split("_")[1])
@@ -165,7 +149,6 @@ async def process_cancel(callback: types.CallbackQuery):
     
     if booking:
         user_id, service, date_str, time_str = booking
-        # Меняем статус на cancelled (освобождаем слот)
         cur.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (booking_id,))
         conn.commit()
         conn.close()
@@ -173,7 +156,6 @@ async def process_cancel(callback: types.CallbackQuery):
         await callback.message.edit_text(f"❌ Запись на {date_str} в {time_str} успешно отменена.")
         await callback.answer("Запись отменена.")
 
-        # Уведомление администратору об отмене
         try:
             admin_text = (
                 f"⚠️ **ЗАПИСЬ ОТМЕНЕНА!**\n"
@@ -190,7 +172,6 @@ async def process_cancel(callback: types.CallbackQuery):
         conn.close()
         await callback.answer("Запись не найдена.")
 
-# --- ПРОЦЕСС ЗАПИСИ И КАЛЕНДАРЬ НА 7 ДНЕЙ ---
 @dp.message(F.text == "💇‍♂️ Записаться")
 async def cmd_book(message: types.Message, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -211,7 +192,6 @@ async def process_service(callback: types.CallbackQuery, state: FSMContext):
     selected_service = services.get(callback.data, "Мужская стрижка")
     await state.update_data(service=selected_service)
 
-    # Генерация календаря на ближайшие 7 дней по времени Бишкека на русском языке
     now_bishkek = datetime.now(BISHKEK_TZ)
     days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     months_ru = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
@@ -223,7 +203,6 @@ async def process_service(callback: types.CallbackQuery, state: FSMContext):
         month_name = months_ru[target_date.month - 1]
         date_str = f"{target_date.day} {month_name} {target_date.year}"
         btn_text = f"{target_date.day} {month_name} ({day_name})"
-        
         keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"date_{date_str}")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
@@ -236,33 +215,26 @@ async def process_date(callback: types.CallbackQuery, state: FSMContext):
     selected_date = callback.data.replace("date_", "")
     await state.update_data(date=selected_date)
 
-    # Получаем уже занятые часы на эту дату из базы данных
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("SELECT time FROM bookings WHERE date = ? AND status = 'confirmed'", (selected_date,))
     booked_times = [row[0] for row in cur.fetchall()]
     conn.close()
 
-    # Рабочее время барбера: с 10:00 до 22:00
     now_bishkek = datetime.now(BISHKEK_TZ)
-    current_date_str = f"{now_bishkek.day} янв фев мар апр май июн июл авг сен окт ноя дек".split()[now_bishkek.month] # упрощенно для сравнения даты
-    # Проверим точное совпадение сегодняшней даты
     months_ru = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
     today_str = f"{now_bishkek.day} {months_ru[now_bishkek.month - 1]} {now_bishkek.year}"
-
     current_hour = now_bishkek.hour if selected_date == today_str else -1
 
     time_buttons = []
     for hour in range(10, 22):
         time_slot = f"{hour:02d}:00"
         
-        # Проверка на прошедшее время текущего дня
         if selected_date == today_str and hour <= current_hour:
-            continue  # Прошедшее время автоматически исчезает/скрывается
+            continue
 
         if time_slot in booked_times:
             btn_text = f"🔴 {time_slot} (Занято)"
-            # Создаем неактивную кнопку или пропускаем, сделаем информативной
             time_buttons.append([InlineKeyboardButton(text=btn_text, callback_data="booked_slot")])
         else:
             btn_text = f"🟢 {time_slot} (Свободно)"
@@ -298,7 +270,6 @@ async def process_phone(message: types.Message, state: FSMContext):
     selected_time = data['time']
     selected_service = data['service']
 
-    # Повторная проверка занятости непосредственно перед сохранением (защита от двойной брони)
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute(
@@ -313,7 +284,6 @@ async def process_phone(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # Сохранение новой записи в базу данных
     cur.execute("""
         INSERT INTO bookings (user_id, user_name, phone, service, date, time, status)
         VALUES (?, ?, ?, ?, ?, ?, 'confirmed')
@@ -321,7 +291,6 @@ async def process_phone(message: types.Message, state: FSMContext):
     conn.commit()
     conn.close()
 
-    # Подтверждение клиенту
     success_text = (
         f"✅ **Вы успешно записаны!**\n\n"
         f"📅 Дата: {selected_date}\n"
@@ -331,7 +300,6 @@ async def process_phone(message: types.Message, state: FSMContext):
     )
     await message.answer(success_text, reply_markup=get_main_menu(), parse_mode="Markdown")
 
-    # Уведомление администратору
     username_info = f"@{message.from_user.username}" if message.from_user.username else "нет username"
     admin_text = (
         f"🔔 **НОВАЯ ЗАПИСЬ!**\n"
@@ -351,7 +319,6 @@ async def process_phone(message: types.Message, state: FSMContext):
 
     await state.clear()
 
-# Запуск бота
 async def main():
     init_db()
     await dp.start_polling(bot)
