@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import sys
+import os
 import sqlite3
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
@@ -8,29 +8,13 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiohttp import web
 
-TOKEN = "8946831317:AAEgn7tYUp90K3QFrAIwqpTtE5zQAxh_fL0"
+# Токен берется из переменных окружения Render
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 7272996140
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER (чтобы бот работал 24/7) ---
-async def handle(request):
-    return web.Response(text="Bot is running and alive 24/7!")
-
-async def web_server():
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 10000
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-# -----------------------------------------------------
-
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 DB_NAME = "barber_base.db"
@@ -169,7 +153,7 @@ async def process_night_phone(message: types.Message, state: FSMContext):
             f"📞 Телефон: <code>{phone}</code>"
         )
         try:
-            await bot.send_message(ADMIN_ID, admin_text)
+            await bot.send_message(ADMIN_ID, admin_text, parse_mode="HTML")
         except Exception as e:
             logging.error(f"Ошибка отправки админу: {e}")
             
@@ -349,7 +333,7 @@ async def process_phone(message: types.Message, state: FSMContext):
             ]
         ])
         try:
-            await bot.send_message(ADMIN_ID, admin_text, reply_markup=admin_kb)
+            await bot.send_message(ADMIN_ID, admin_text, parse_mode="HTML", reply_markup=admin_kb)
         except Exception as e:
             logging.error(f"Ошибка отправки админу: {e}")
             
@@ -372,7 +356,8 @@ async def admin_action(callback: types.CallbackQuery):
         update_booking_status(booking_id, "confirmed")
         try:
             await callback.message.edit_text(
-                callback.message.text + "\n\n<b>✅ СТАТУС: Подтверждено администратором</b>"
+                callback.message.text + "\n\n<b>✅ СТАТУС: Подтверждено администратором</b>",
+                parse_mode="HTML"
             )
         except:
             pass
@@ -389,7 +374,8 @@ async def admin_action(callback: types.CallbackQuery):
         update_booking_status(booking_id, "cancelled")
         try:
             await callback.message.edit_text(
-                callback.message.text + "\n\n<b>❌ СТАТУС: Отменено</b>"
+                callback.message.text + "\n\n<b>❌ СТАТУС: Отменено</b>",
+                parse_mode="HTML"
             )
         except:
             pass
@@ -404,8 +390,6 @@ async def admin_action(callback: types.CallbackQuery):
 
 async def main():
     init_db()
-    # Запускаем фоновый веб-сервер для Render и пуллинг бота одновременно
-    asyncio.create_task(web_server())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
