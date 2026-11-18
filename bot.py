@@ -18,10 +18,11 @@ dp = Dispatcher()
 
 DB_NAME = "barber_base.db"
 
-# Инициализация базы данных
+# Инициализация базы данных (создаем обе таблицы)
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
+    # Таблица записей
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,6 +33,14 @@ def init_db():
             date TEXT,
             time TEXT,
             status TEXT DEFAULT 'confirmed'
+        )
+    """)
+    # Таблица пользователей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT
         )
     """)
     conn.commit()
@@ -64,4 +73,3 @@ async def main():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
-     
