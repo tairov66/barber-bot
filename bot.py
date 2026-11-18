@@ -8,13 +8,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 # Токен берется из переменных окружения Render
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 727996140
-
-# Токен берется из переменных окружения Render
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 7272996140
-
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
