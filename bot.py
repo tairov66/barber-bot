@@ -9,8 +9,9 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardBut
 
 # Токен берется из переменных окружения Render
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# Токен берется из переменных окружения Render
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = 727996140
 
 DB_NAME = "barber_base.db"
 
