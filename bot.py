@@ -1,5 +1,3 @@
-import asyncio
-import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -7,7 +5,11 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+
+# Токен берется из переменных окружения Render
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = 727996140
 
 # Токен берется из переменных окружения Render
 BOT_TOKEN = os.getenv("BOT_TOKEN")
