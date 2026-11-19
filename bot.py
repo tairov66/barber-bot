@@ -15,16 +15,19 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardBut
 
 BISHKEK_TZ = pytz.timezone("Asia/Bishkek")
 
+
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
 
+
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
     server.serve_forever()
+
 
 Thread(target=run_web_server, daemon=True).start()
 
@@ -36,16 +39,19 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+
 def get_db_connection():
     if not DATABASE_URL:
         raise RuntimeError("Не задана переменная окружения DATABASE_URL")
     return psycopg2.connect(DATABASE_URL)
+
 
 class BookingState(StatesGroup):
     waiting_for_service = State()
     waiting_for_date = State()
     waiting_for_time = State()
     waiting_for_phone = State()
+
 
 def init_db():
     conn = get_db_connection()
@@ -73,6 +79,7 @@ def init_db():
     cur.close()
     conn.close()
 
+
 def get_main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -82,6 +89,7 @@ def get_main_menu():
         resize_keyboard=True
     )
 
+
 def get_phone_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -90,6 +98,7 @@ def get_phone_keyboard():
         resize_keyboard=True,
         one_time_keyboard=True
     )
+
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -112,6 +121,7 @@ async def cmd_start(message: types.Message):
         reply_markup=get_main_menu()
     )
 
+
 @dp.message(F.text == "📍 Адрес и контакты")
 async def cmd_contacts(message: types.Message):
     await message.answer(
@@ -122,12 +132,14 @@ async def cmd_contacts(message: types.Message):
         parse_mode="Markdown"
     )
 
+
 @dp.message(F.text == "ℹ️ О нас")
 async def cmd_about(message: types.Message):
     await message.answer(
         "✂️ Мы — лучший барбершоп в городе. Стильные стрижки, борода, качественный сервис и крутая атмосфера!",
         reply_markup=get_main_menu()
     )
+
 
 @dp.message(F.text == "📋 Мои записи")
 async def cmd_my_bookings(message: types.Message):
@@ -157,6 +169,7 @@ async def cmd_my_bookings(message: types.Message):
             [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"cancel_{booking_id}")]
         ])
         await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+
 
 @dp.callback_query(F.data.startswith("cancel_"))
 async def process_cancel(callback: types.CallbackQuery):
@@ -207,6 +220,7 @@ async def process_cancel(callback: types.CallbackQuery):
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление админу: {e}")
 
+
 @dp.message(F.text == "💇‍♂️ Записаться")
 async def cmd_book(message: types.Message, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -216,6 +230,7 @@ async def cmd_book(message: types.Message, state: FSMContext):
     ])
     await message.answer("Выберите услугу:", reply_markup=keyboard)
     await state.set_state(BookingState.waiting_for_service)
+
 
 @dp.callback_query(BookingState.waiting_for_service, F.data.startswith("srv_"))
 async def process_service(callback: types.CallbackQuery, state: FSMContext):
@@ -244,6 +259,7 @@ async def process_service(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("📅 Выберите удобную дату:", reply_markup=keyboard)
     await state.set_state(BookingState.waiting_for_date)
     await callback.answer()
+
 
 @dp.callback_query(BookingState.waiting_for_date, F.data.startswith("date_"))
 async def process_date(callback: types.CallbackQuery, state: FSMContext):
@@ -285,9 +301,11 @@ async def process_date(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(BookingState.waiting_for_time)
     await callback.answer()
 
+
 @dp.callback_query(F.data == "booked_slot")
 async def alert_booked(callback: types.CallbackQuery):
     await callback.answer("❌ Это время уже занято, выберите другой слот.", show_alert=True)
+
 
 @dp.callback_query(BookingState.waiting_for_time, F.data.startswith("time_"))
 async def process_time(callback: types.CallbackQuery, state: FSMContext):
@@ -301,6 +319,7 @@ async def process_time(callback: types.CallbackQuery, state: FSMContext):
     )
     await state.set_state(BookingState.waiting_for_phone)
     await callback.answer()
+
 
 @dp.message(BookingState.waiting_for_phone)
 async def process_phone(message: types.Message, state: FSMContext):
@@ -329,3 +348,61 @@ async def process_phone(message: types.Message, state: FSMContext):
     cur.execute(
         "SELECT id FROM bookings WHERE date = %s AND time = %s AND status = 'confirmed'",
         (selected_date, selected_time)
+    )
+    existing = cur.fetchone()
+
+    if existing:
+        cur.close()
+        conn.close()
+        await message.answer(
+            "⚠️ К сожалению, этот слот только что забронировали. Пожалуйста, выберите другое время.",
+            reply_markup=get_main_menu()
+        )
+        await state.clear()
+        return
+
+    cur.execute("""
+        INSERT INTO bookings (user_id, user_name, phone, service, date, time, status)
+        VALUES (%s, %s, %s, %s, %s, %s, 'confirmed')
+    """, (message.from_user.id, message.from_user.full_name, phone, selected_service, selected_date, selected_time))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    success_text = (
+        f"✅ **Вы успешно записаны!**\n\n"
+        f"📅 Дата: {selected_date}\n"
+        f"🕒 Время: {selected_time}\n"
+        f"✂️ Услуга: {selected_service}\n"
+        f"📞 Телефон: {phone}\n"
+        f"📍 Адрес барбершопа: г. Ош"
+    )
+    await message.answer(success_text, reply_markup=get_main_menu(), parse_mode="Markdown")
+
+    username_info = f"@{message.from_user.username}" if message.from_user.username else "нет username"
+    admin_text = (
+        f"🔔 **НОВАЯ ЗАПИСЬ!**\n"
+        f"👤 Клиент: {message.from_user.full_name}\n"
+        f"📱 Telegram: {username_info} (ID: `{message.from_user.id}`)\n"
+        f"📞 Телефон: {phone}\n"
+        f"✂️ Услуга: {selected_service}\n"
+        f"📅 Дата: {selected_date}\n"
+        f"🕒 Время: {selected_time}\n"
+        f"💈 Барбер: Основной зал\n"
+        f"✅ Статус: Подтверждено"
+    )
+    try:
+        await bot.send_message(ADMIN_ID, admin_text, parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Не удалось отправить уведомление админу: {e}")
+
+    await state.clear()
+
+
+async def main():
+    init_db()
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
