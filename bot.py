@@ -82,6 +82,15 @@ def get_main_menu():
         resize_keyboard=True
     )
 
+def get_phone_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📲 Отправить мой номер телефона", request_contact=True)]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     conn = get_db_connection()
@@ -285,13 +294,31 @@ async def process_time(callback: types.CallbackQuery, state: FSMContext):
     selected_time = callback.data.replace("time_", "")
     await state.update_data(time=selected_time)
 
-    await callback.message.edit_text("📞 Пожалуйста, отправьте ваш номер телефона для подтверждения брони:")
+    await callback.message.edit_text(f"🕒 Выбрано время: **{selected_time}**", parse_mode="Markdown")
+    await callback.message.answer(
+        "📱 Для подтверждения записи поделитесь своим номером телефона.",
+        reply_markup=get_phone_keyboard()
+    )
     await state.set_state(BookingState.waiting_for_phone)
     await callback.answer()
 
 @dp.message(BookingState.waiting_for_phone)
 async def process_phone(message: types.Message, state: FSMContext):
-    phone = message.text
+    if not message.contact:
+        await message.answer(
+            "⚠️ Пожалуйста, воспользуйтесь кнопкой «📲 Отправить мой номер телефона» ниже, чтобы поделиться своим номером.",
+            reply_markup=get_phone_keyboard()
+        )
+        return
+
+    if message.contact.user_id != message.from_user.id:
+        await message.answer(
+            "⚠️ Отправлен чужой контакт. Пожалуйста, отправьте именно свой номер телефона через кнопку ниже.",
+            reply_markup=get_phone_keyboard()
+        )
+        return
+
+    phone = message.contact.phone_number
     data = await state.get_data()
     selected_date = data['date']
     selected_time = data['time']
@@ -308,7 +335,10 @@ async def process_phone(message: types.Message, state: FSMContext):
     if existing:
         cur.close()
         conn.close()
-        await message.answer("⚠️ К сожалению, этот слот только что забронировали. Пожалуйста, начните запись заново через /start.")
+        await message.answer(
+            "⚠️ К сожалению, этот слот только что забронировали. Пожалуйста, выберите другое время.",
+            reply_markup=get_main_menu()
+        )
         await state.clear()
         return
 
@@ -325,6 +355,7 @@ async def process_phone(message: types.Message, state: FSMContext):
         f"📅 Дата: {selected_date}\n"
         f"🕒 Время: {selected_time}\n"
         f"✂️ Услуга: {selected_service}\n"
+        f"📞 Телефон: {phone}\n"
         f"📍 Адрес барбершопа: г. Ош"
     )
     await message.answer(success_text, reply_markup=get_main_menu(), parse_mode="Markdown")
