@@ -33,6 +33,8 @@ SERVICE_NAME_TO_DURATION = {
     for cfg in SERVICE_CONFIG.values()
 }
 
+ACTIVE_BOOKING_STATUSES = ("pending", "confirmed")
+
 MONTHS_RU = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря"
@@ -187,12 +189,25 @@ def verify_db_schema(cur):
     if missing_columns:
         raise RuntimeError(f"Неполная структура таблицы bookings: отсутствуют колонки {sorted(missing_columns)}")
 
+    cur.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'callback_requests'
+          AND column_name IN ('id', 'user_id', 'phone', 'service', 'desired_date', 'desired_time', 'status')
+    """)
+    cb_columns = {row[0] for row in cur.fetchall()}
+    required_cb_columns = {"id", "user_id", "phone", "service", "desired_date", "desired_time", "status"}
+    missing_cb_columns = required_cb_columns - cb_columns
+    if missing_cb_columns:
+        raise RuntimeError(f"Неполная структура таблицы callback_requests: отсутствуют колонки {sorted(missing_cb_columns)}")
+
 
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # 1. Основная транзакция: таблицы, колонки, бэкфилл интервалов
+        # 1. Основная транзакция: таблицы, колонки, безопасный бэкфилл интервалов без удаления данных
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -209,7 +224,7 @@ def init_db():
                 service TEXT,
                 date TEXT,
                 time TEXT,
-                status TEXT DEFAULT 'confirmed',
+                status TEXT DEFAULT 'pending',
                 duration_minutes INTEGER DEFAULT 60,
                 start_minutes INTEGER,
                 end_minutes INTEGER
@@ -218,6 +233,7 @@ def init_db():
         cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS duration_minutes INTEGER DEFAULT 60")
         cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS start_minutes INTEGER")
         cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS end_minutes INTEGER")
+        cur.execute("ALTER TABLE bookings ALTER COLUMN status SET DEFAULT 'pending'")
 
         cur.execute("""
             SELECT id, service, time, duration_minutes, start_minutes, end_minutes
@@ -256,34 +272,75 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cur.execute("ALTER TABLE callback_requests ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP")
         conn.commit()
 
-        # 2. Отдельная транзакция / SAVEPOINT для GiST-ограничения, чтобы ошибка не затрагивала структуру БД
+        # 2. Проверка существующих ограничений и обновление GiST-ограничения для status IN ('pending', 'confirmed')
         try:
             cur.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
             cur.execute("SAVEPOINT gist_constraint_sp")
+
+            # Проверяем существующее определение ограничения
             cur.execute("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1
-                        FROM pg_constraint
-                        WHERE conname = 'bookings_no_overlap_confirmed'
-                    ) THEN
+                SELECT pg_get_constraintdef(c.oid)
+                FROM pg_constraint c
+                JOIN pg_class t ON c.conrelid = t.oid
+                JOIN pg_namespace n ON t.relnamespace = n.oid
+                WHERE n.nspname = 'public'
+                  AND t.relname = 'bookings'
+                  AND c.conname = 'bookings_no_overlap_confirmed'
+            """)
+            old_def_row = cur.fetchone()
+            needs_recreate = True
+            if old_def_row and old_def_row[0]:
+                def_text = old_def_row[0]
+                if "pending" in def_text and "confirmed" in def_text:
+                    needs_recreate = False
+
+            if needs_recreate:
+                # Проверяем, нет ли в базе уже конфликтующих активных (pending/confirmed) записей перед созданием ограничения
+                cur.execute("""
+                    SELECT b1.id, b2.id
+                    FROM bookings b1
+                    JOIN bookings b2
+                      ON b1.id < b2.id
+                     AND b1.date = b2.date
+                     AND b1.status IN ('pending', 'confirmed')
+                     AND b2.status IN ('pending', 'confirmed')
+                     AND b1.start_minutes IS NOT NULL
+                     AND b1.end_minutes IS NOT NULL
+                     AND b2.start_minutes IS NOT NULL
+                     AND b2.end_minutes IS NOT NULL
+                     AND b1.start_minutes < b2.end_minutes
+                     AND b1.end_minutes > b2.start_minutes
+                    LIMIT 1
+                """)
+                conflict_pair = cur.fetchone()
+                if conflict_pair:
+                    logging.warning(
+                        f"Обнаружены существующие пересекающиеся записи {conflict_pair}; "
+                        f"данные сохранены без удаления, GiST-ограничение не пересоздано."
+                    )
+                else:
+                    if old_def_row:
+                        cur.execute("ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_no_overlap_confirmed")
+                    cur.execute("""
                         ALTER TABLE bookings
                         ADD CONSTRAINT bookings_no_overlap_confirmed
                         EXCLUDE USING gist (
                             date WITH =,
                             int4range(start_minutes, end_minutes, '[)') WITH &&
                         )
-                        WHERE (status = 'confirmed' AND start_minutes IS NOT NULL AND end_minutes IS NOT NULL);
-                    END IF;
-                END$$;
-            """)
+                        WHERE (
+                            status IN ('pending', 'confirmed')
+                            AND start_minutes IS NOT NULL
+                            AND end_minutes IS NOT NULL
+                        )
+                    """)
             cur.execute("RELEASE SAVEPOINT gist_constraint_sp")
             conn.commit()
         except Exception as e:
-            logging.warning(f"Не удалось создать GIST constraint (проверка пересечений в транзакции активна): {e}")
+            logging.warning(f"Не удалось обновить GIST constraint (проверка пересечений в транзакции активна): {e}")
             try:
                 cur.execute("ROLLBACK TO SAVEPOINT gist_constraint_sp")
             except Exception:
@@ -305,7 +362,7 @@ def get_booked_intervals(cur, date_str: str) -> list[tuple[int, int]]:
         """
         SELECT service, time, duration_minutes, start_minutes, end_minutes
         FROM bookings
-        WHERE date = %s AND status = 'confirmed'
+        WHERE date = %s AND status IN ('pending', 'confirmed')
         """,
         (date_str,)
     )
@@ -416,7 +473,12 @@ async def cmd_my_bookings(message: types.Message):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, service, date, time FROM bookings WHERE user_id = %s AND status = 'confirmed' ORDER BY id DESC",
+        """
+        SELECT id, service, date, time, status
+        FROM bookings
+        WHERE user_id = %s AND status IN ('pending', 'confirmed')
+        ORDER BY id DESC
+        """,
         (message.from_user.id,)
     )
     rows = cur.fetchall()
@@ -424,19 +486,27 @@ async def cmd_my_bookings(message: types.Message):
     conn.close()
 
     if not rows:
-        await message.answer("У вас пока нет активных записей.", reply_markup=get_main_menu())
+        await message.answer("У вас пока нет активных или ожидающих записей.", reply_markup=get_main_menu())
         return
 
+    status_labels = {
+        "pending": "🕒 Ожидает подтверждения администратора",
+        "confirmed": "✅ Подтверждена"
+    }
+
     for row in rows:
-        booking_id, service, date_str, time_str = row
+        booking_id, service, date_str, time_str, status = row
+        status_text = status_labels.get(status, status)
+        cancel_btn_text = "❌ Отменить заявку" if status == "pending" else "❌ Отменить запись"
         text = (
             f"📋 **Ваша запись:**\n"
             f"✂️ Услуга: {service}\n"
             f"📅 Дата: {date_str}\n"
-            f"⏰ Время: {time_str}"
+            f"⏰ Время: {time_str}\n"
+            f"📌 Статус: {status_text}"
         )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"cancel_{booking_id}")]
+            [InlineKeyboardButton(text=cancel_btn_text, callback_data=f"cancel_{booking_id}")]
         ])
         await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
@@ -455,8 +525,8 @@ async def process_cancel(callback: types.CallbackQuery):
         """
         UPDATE bookings
         SET status = 'cancelled'
-        WHERE id = %s AND user_id = %s AND status = 'confirmed'
-        RETURNING user_id, service, date, time
+        WHERE id = %s AND user_id = %s AND status IN ('pending', 'confirmed')
+        RETURNING user_id, service, date, time, status
         """,
         (booking_id, callback.from_user.id)
     )
@@ -467,28 +537,305 @@ async def process_cancel(callback: types.CallbackQuery):
 
     if not cancelled_booking:
         await callback.answer(
-            "❌ Не удалось отменить запись: она не найдена, уже отменена или принадлежит другому пользователю.",
+            "❌ Не удалось отменить запись: она не найдена, уже отменена/отклонена или принадлежит другому пользователю.",
             show_alert=True
         )
         return
 
-    user_id, service, date_str, time_str = cancelled_booking
+    user_id, service, date_str, time_str, _ = cancelled_booking
 
     await callback.message.edit_text(f"❌ Запись на {date_str} в {time_str} успешно отменена.")
     await callback.answer("Запись отменена.")
 
     try:
         admin_text = (
-            f"⚠️ **ЗАПИСЬ ОТМЕНЕНА!**\n"
+            f"⚠️ **ЗАПИСЬ ОТМЕНЕНА КЛИЕНТОМ!**\n"
+            f"🆔 Заявка №{booking_id}\n"
             f"👤 Клиент ID: `{user_id}`\n"
             f"✂️ Услуга: {service}\n"
             f"📅 Дата: {date_str}\n"
             f"🕒 Время: {time_str}\n"
-            f"❌ Статус: Отменено"
+            f"❌ Статус: Отменено клиентом"
         )
         await bot.send_message(ADMIN_ID, admin_text, parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление админу: {e}")
+
+
+@dp.callback_query(F.data.startswith("admin_approve_"))
+async def process_admin_approve(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ У вас нет прав для управления заявками.", show_alert=True)
+        return
+
+    try:
+        booking_id = int(callback.data.split("_")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор заявки.", show_alert=True)
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN")
+        cur.execute(
+            """
+            UPDATE bookings
+            SET status = 'confirmed'
+            WHERE id = %s AND status = 'pending'
+            RETURNING user_id, user_name, phone, service, date, time, duration_minutes
+            """,
+            (booking_id,)
+        )
+        approved_row = cur.fetchone()
+
+        if not approved_row:
+            cur.execute("SELECT status FROM bookings WHERE id = %s", (booking_id,))
+            current_row = cur.fetchone()
+            conn.commit()
+            cur.close()
+            conn.close()
+            current_status = current_row[0] if current_row else "не найдена"
+            await callback.answer(f"ℹ️ Заявка уже обработана (статус: {current_status}).", show_alert=True)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        logging.error(f"Ошибка при одобрении заявки #{booking_id}: {e}")
+        await callback.answer("⚠️ Ошибка базы данных при одобрении заявки.", show_alert=True)
+        return
+
+    cur.close()
+    conn.close()
+
+    user_id, user_name, phone, service, date_str, time_str, duration_minutes = approved_row
+    dur_val = duration_minutes or get_service_duration(service)
+
+    updated_admin_text = (
+        f"✅ **ЗАЯВКА ОДОБРЕНА!**\n"
+        f"🆔 Заявка №{booking_id}\n"
+        f"👤 Клиент: {user_name or 'Клиент'} (ID: `{user_id}`)\n"
+        f"📞 Телефон: {phone}\n"
+        f"✂️ Услуга: {service}\n"
+        f"📅 Дата: {date_str}\n"
+        f"🕒 Время: {time_str} ({dur_val} мин)\n"
+        f"🟢 Статус: Подтверждено"
+    )
+    try:
+        await callback.message.edit_text(updated_admin_text, parse_mode="Markdown")
+    except Exception:
+        pass
+    await callback.answer("✅ Запись одобрена!")
+
+    client_text = (
+        f"✅ **Ваша запись подтверждена администратором!**\n\n"
+        f"📅 Дата: {date_str}\n"
+        f"🕒 Время: {time_str} ({dur_val} мин)\n"
+        f"✂️ Услуга: {service}\n"
+        f"📍 Адрес барбершопа: г. Ош\n\n"
+        f"Ждём вас! 💈"
+    )
+    try:
+        await bot.send_message(user_id, client_text, reply_markup=get_main_menu(), parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Не удалось отправить подтверждение клиенту {user_id}: {e}")
+
+
+@dp.callback_query(F.data.startswith("admin_reject_"))
+async def process_admin_reject(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ У вас нет прав для управления заявками.", show_alert=True)
+        return
+
+    try:
+        booking_id = int(callback.data.split("_")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор заявки.", show_alert=True)
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN")
+        cur.execute(
+            """
+            UPDATE bookings
+            SET status = 'rejected'
+            WHERE id = %s AND status = 'pending'
+            RETURNING user_id, user_name, phone, service, date, time, duration_minutes
+            """,
+            (booking_id,)
+        )
+        rejected_row = cur.fetchone()
+
+        if not rejected_row:
+            cur.execute("SELECT status FROM bookings WHERE id = %s", (booking_id,))
+            current_row = cur.fetchone()
+            conn.commit()
+            cur.close()
+            conn.close()
+            current_status = current_row[0] if current_row else "не найдена"
+            await callback.answer(f"ℹ️ Заявка уже обработана (статус: {current_status}).", show_alert=True)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        logging.error(f"Ошибка при отклонении заявки #{booking_id}: {e}")
+        await callback.answer("⚠️ Ошибка базы данных при отклонении заявки.", show_alert=True)
+        return
+
+    cur.close()
+    conn.close()
+
+    user_id, user_name, phone, service, date_str, time_str, duration_minutes = rejected_row
+    dur_val = duration_minutes or get_service_duration(service)
+
+    updated_admin_text = (
+        f"❌ **ЗАЯВКА ОТКЛОНЕНА!**\n"
+        f"🆔 Заявка №{booking_id}\n"
+        f"👤 Клиент: {user_name or 'Клиент'} (ID: `{user_id}`)\n"
+        f"📞 Телефон: {phone}\n"
+        f"✂️ Услуга: {service}\n"
+        f"📅 Дата: {date_str}\n"
+        f"🕒 Время: {time_str} ({dur_val} мин)\n"
+        f"🔴 Статус: Отклонено (слот освобождён)"
+    )
+    try:
+        await callback.message.edit_text(updated_admin_text, parse_mode="Markdown")
+    except Exception:
+        pass
+    await callback.answer("❌ Заявка отклонена, время освобождено.")
+
+    client_text = (
+        f"😔 К сожалению, администратор не смог подтвердить вашу запись на **{date_str} в {time_str}** ({service}).\n\n"
+        f"Пожалуйста, выберите другое удобное время через кнопку «💇‍♂️ Записаться» — мы с радостью вас примем! ☺️"
+    )
+    try:
+        await bot.send_message(user_id, client_text, reply_markup=get_main_menu(), parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Не удалось отправить уведомление об отклонении клиенту {user_id}: {e}")
+
+
+@dp.callback_query(F.data.startswith("cb_contacted_"))
+async def process_callback_contacted(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ У вас нет прав для управления заявками.", show_alert=True)
+        return
+
+    try:
+        cb_id = int(callback.data.split("_")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор заявки.", show_alert=True)
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE callback_requests
+        SET status = 'contacted', updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s AND status = 'pending_callback'
+        RETURNING user_name, phone, service, desired_date, desired_time
+        """,
+        (cb_id,)
+    )
+    updated_row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    if not updated_row:
+        await callback.answer("ℹ️ Эта заявка на обратный звонок уже обработана.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    client_name, phone, service, desired_date, desired_time = updated_row
+    new_text = (
+        f"📞 ЗАЯВКА НА ОБРАТНЫЙ ЗВОНОК — СВЯЗАЛИСЬ!\n"
+        f"🆔 Заявка №{cb_id}\n"
+        f"👤 Клиент: {client_name or 'Клиент'}\n"
+        f"📞 Телефон: {phone}\n"
+        f"📅 Желаемая дата: {desired_date}\n"
+        f"🕒 Желаемое время: {desired_time}\n"
+        f"✂️ Услуга: {service}\n"
+        f"🟢 Статус: Связался"
+    )
+    try:
+        await callback.message.edit_text(new_text)
+    except Exception:
+        pass
+    await callback.answer("📞 Статус обновлён: Связался")
+
+
+@dp.callback_query(F.data.startswith("cb_close_"))
+async def process_callback_close(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ У вас нет прав для управления заявками.", show_alert=True)
+        return
+
+    try:
+        cb_id = int(callback.data.split("_")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный идентификатор заявки.", show_alert=True)
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE callback_requests
+        SET status = 'closed', updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s AND status IN ('pending_callback', 'contacted')
+        RETURNING user_name, phone, service, desired_date, desired_time
+        """,
+        (cb_id,)
+    )
+    updated_row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    if not updated_row:
+        await callback.answer("ℹ️ Эта заявка на обратный звонок уже закрыта.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    client_name, phone, service, desired_date, desired_time = updated_row
+    new_text = (
+        f"❌ ЗАЯВКА НА ОБРАТНЫЙ ЗВОНОК — ЗАКРЫТА\n"
+        f"🆔 Заявка №{cb_id}\n"
+        f"👤 Клиент: {client_name or 'Клиент'}\n"
+        f"📞 Телефон: {phone}\n"
+        f"📅 Желаемая дата: {desired_date}\n"
+        f"🕒 Желаемое время: {desired_time}\n"
+        f"✂️ Услуга: {service}\n"
+        f"⚫️ Статус: Закрыта"
+    )
+    try:
+        await callback.message.edit_text(new_text)
+    except Exception:
+        pass
+    await callback.answer("❌ Заявка закрыта")
 
 
 @dp.message(F.text == "💇‍♂️ Записаться")
@@ -796,9 +1143,12 @@ async def process_callback_phone(message: types.Message, state: FSMContext):
         """
         INSERT INTO callback_requests (user_id, user_name, phone, service, desired_date, desired_time, status)
         VALUES (%s, %s, %s, %s, %s, %s, 'pending_callback')
+        RETURNING id
         """,
         (message.from_user.id, client_name, phone, service, desired_date, desired_time)
     )
+    cb_row = cur.fetchone()
+    cb_id = cb_row[0] if cb_row else 0
     conn.commit()
     cur.close()
     conn.close()
@@ -811,6 +1161,7 @@ async def process_callback_phone(message: types.Message, state: FSMContext):
 
     admin_text = (
         f"🔔 НОВАЯ ЗАЯВКА НА ОБРАТНЫЙ ЗВОНОК!\n"
+        f"🆔 Заявка №{cb_id}\n"
         f"👤 Клиент: {client_name}\n"
         f"📞 Телефон: {phone}\n"
         f"📅 Желаемая дата: {desired_date}\n"
@@ -818,8 +1169,14 @@ async def process_callback_phone(message: types.Message, state: FSMContext):
         f"✂️ Услуга: {service}\n"
         f"🟡 Статус: Ожидает согласования"
     )
+    admin_cb_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📞 Связался", callback_data=f"cb_contacted_{cb_id}"),
+            InlineKeyboardButton(text="❌ Закрыть заявку", callback_data=f"cb_close_{cb_id}")
+        ]
+    ])
     try:
-        await bot.send_message(ADMIN_ID, admin_text)
+        await bot.send_message(ADMIN_ID, admin_text, reply_markup=admin_cb_keyboard)
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление админу о заявке на обратный звонок: {e}")
 
@@ -900,7 +1257,8 @@ async def process_phone(message: types.Message, state: FSMContext):
                 user_id, user_name, phone, service, date, time, status,
                 duration_minutes, start_minutes, end_minutes
             )
-            VALUES (%s, %s, %s, %s, %s, %s, 'confirmed', %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s)
+            RETURNING id
             """,
             (
                 message.from_user.id,
@@ -914,16 +1272,18 @@ async def process_phone(message: types.Message, state: FSMContext):
                 end_minutes,
             )
         )
+        booking_row = cur.fetchone()
+        booking_id = booking_row[0] if booking_row else 0
         conn.commit()
     except psycopg2.Error as e:
         conn.rollback()
         cur.close()
         conn.close()
-        logging.error(f"Ошибка при сохранении брони в PostgreSQL: {e}")
+        logging.error(f"Ошибка при сохранении заявки в PostgreSQL: {e}")
         nearest = find_nearest_free_times(selected_date, duration_minutes, start_minutes)
         hint = f"\nБлижайшие свободные варианты: {', '.join(nearest)}." if nearest else ""
         await message.answer(
-            f"⚠️ Не удалось подтвердить бронь — время уже занято.{hint}",
+            f"⚠️ Не удалось оформить заявку — время уже занято.{hint}",
             reply_markup=get_main_menu()
         )
         await state.clear()
@@ -933,30 +1293,31 @@ async def process_phone(message: types.Message, state: FSMContext):
     conn.close()
     await state.update_data(booking_submitted=True)
 
-    success_text = (
-        f"✅ **Вы успешно записаны!**\n\n"
-        f"📅 Дата: {selected_date}\n"
-        f"🕒 Время: {formatted_time} ({duration_minutes} мин)\n"
-        f"✂️ Услуга: {selected_service}\n"
-        f"📞 Телефон: {phone}\n"
-        f"📍 Адрес барбершопа: г. Ош"
+    await message.answer(
+        "🕒 Ваша заявка получена и ожидает подтверждения администратора. Мы скоро сообщим результат! ☺️",
+        reply_markup=get_main_menu()
     )
-    await message.answer(success_text, reply_markup=get_main_menu(), parse_mode="Markdown")
 
     username_info = f"@{message.from_user.username}" if message.from_user.username else "нет username"
     admin_text = (
-        f"🔔 **НОВАЯ ЗАПИСЬ!**\n"
+        f"🔔 **НОВАЯ ЗАЯВКА НА ЗАПИСЬ!**\n"
+        f"🆔 Заявка №{booking_id}\n"
         f"👤 Клиент: {message.from_user.full_name}\n"
         f"📱 Telegram: {username_info} (ID: `{message.from_user.id}`)\n"
         f"📞 Телефон: {phone}\n"
         f"✂️ Услуга: {selected_service}\n"
         f"📅 Дата: {selected_date}\n"
         f"🕒 Время: {formatted_time} ({duration_minutes} мин)\n"
-        f"💈 Барбер: Основной зал\n"
-        f"✅ Статус: Подтверждено"
+        f"🟡 Статус: Ожидает подтверждения"
     )
+    admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"admin_approve_{booking_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"admin_reject_{booking_id}")
+        ]
+    ])
     try:
-        await bot.send_message(ADMIN_ID, admin_text, parse_mode="Markdown")
+        await bot.send_message(ADMIN_ID, admin_text, reply_markup=admin_keyboard, parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление админу: {e}")
 
