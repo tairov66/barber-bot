@@ -1,9 +1,9 @@
 import os
-import sqlite3
 import logging
 import asyncio
 from datetime import datetime, timedelta
 import pytz
+import psycopg2
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 
@@ -29,13 +29,17 @@ def run_web_server():
 Thread(target=run_web_server, daemon=True).start()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = 727996140
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-DB_NAME = "barber_base.db"
+def get_db_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("Не задана переменная окружения DATABASE_URL")
+    return psycopg2.connect(DATABASE_URL)
 
 class BookingState(StatesGroup):
     waiting_for_service = State()
@@ -44,19 +48,19 @@ class BookingState(StatesGroup):
     waiting_for_phone = State()
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             username TEXT,
             full_name TEXT
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             user_name TEXT,
             phone TEXT,
             service TEXT,
@@ -66,6 +70,7 @@ def init_db():
         )
     """)
     conn.commit()
+    cur.close()
     conn.close()
 
 def get_main_menu():
@@ -79,13 +84,18 @@ def get_main_menu():
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
+        """
+        INSERT INTO users (user_id, username, full_name)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO NOTHING
+        """,
         (message.from_user.id, message.from_user.username, message.from_user.full_name)
     )
     conn.commit()
+    cur.close()
     conn.close()
 
     await message.answer(
@@ -112,13 +122,14 @@ async def cmd_about(message: types.Message):
 
 @dp.message(F.text == "📋 Мои записи")
 async def cmd_my_bookings(message: types.Message):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, service, date, time FROM bookings WHERE user_id = ? AND status = 'confirmed'",
+        "SELECT id, service, date, time FROM bookings WHERE user_id = %s AND status = 'confirmed' ORDER BY id DESC",
         (message.from_user.id,)
     )
     rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     if not rows:
@@ -141,16 +152,17 @@ async def cmd_my_bookings(message: types.Message):
 @dp.callback_query(F.data.startswith("cancel_"))
 async def process_cancel(callback: types.CallbackQuery):
     booking_id = int(callback.data.split("_")[1])
-    
-    conn = sqlite3.connect(DB_NAME)
+
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT user_id, service, date, time FROM bookings WHERE id = ?", (booking_id,))
+    cur.execute("SELECT user_id, service, date, time FROM bookings WHERE id = %s", (booking_id,))
     booking = cur.fetchone()
-    
+
     if booking:
         user_id, service, date_str, time_str = booking
-        cur.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (booking_id,))
+        cur.execute("UPDATE bookings SET status = 'cancelled' WHERE id = %s", (booking_id,))
         conn.commit()
+        cur.close()
         conn.close()
 
         await callback.message.edit_text(f"❌ Запись на {date_str} в {time_str} успешно отменена.")
@@ -169,6 +181,7 @@ async def process_cancel(callback: types.CallbackQuery):
         except Exception as e:
             logging.error(f"Не удалось отправить уведомление админу: {e}")
     else:
+        cur.close()
         conn.close()
         await callback.answer("Запись не найдена.")
 
@@ -215,10 +228,11 @@ async def process_date(callback: types.CallbackQuery, state: FSMContext):
     selected_date = callback.data.replace("date_", "")
     await state.update_data(date=selected_date)
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT time FROM bookings WHERE date = ? AND status = 'confirmed'", (selected_date,))
+    cur.execute("SELECT time FROM bookings WHERE date = %s AND status = 'confirmed'", (selected_date,))
     booked_times = [row[0] for row in cur.fetchall()]
+    cur.close()
     conn.close()
 
     now_bishkek = datetime.now(BISHKEK_TZ)
@@ -229,7 +243,7 @@ async def process_date(callback: types.CallbackQuery, state: FSMContext):
     time_buttons = []
     for hour in range(10, 22):
         time_slot = f"{hour:02d}:00"
-        
+
         if selected_date == today_str and hour <= current_hour:
             continue
 
@@ -270,15 +284,16 @@ async def process_phone(message: types.Message, state: FSMContext):
     selected_time = data['time']
     selected_service = data['service']
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id FROM bookings WHERE date = ? AND time = ? AND status = 'confirmed'",
+        "SELECT id FROM bookings WHERE date = %s AND time = %s AND status = 'confirmed'",
         (selected_date, selected_time)
     )
     existing = cur.fetchone()
 
     if existing:
+        cur.close()
         conn.close()
         await message.answer("⚠️ К сожалению, этот слот только что забронировали. Пожалуйста, начните запись заново через /start.")
         await state.clear()
@@ -286,9 +301,10 @@ async def process_phone(message: types.Message, state: FSMContext):
 
     cur.execute("""
         INSERT INTO bookings (user_id, user_name, phone, service, date, time, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'confirmed')
+        VALUES (%s, %s, %s, %s, %s, %s, 'confirmed')
     """, (message.from_user.id, message.from_user.full_name, phone, selected_service, selected_date, selected_time))
     conn.commit()
+    cur.close()
     conn.close()
 
     success_text = (
