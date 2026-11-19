@@ -30,7 +30,7 @@ Thread(target=run_web_server, daemon=True).start()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = 7272996140
+ADMIN_ID = 727996140
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -151,39 +151,52 @@ async def cmd_my_bookings(message: types.Message):
 
 @dp.callback_query(F.data.startswith("cancel_"))
 async def process_cancel(callback: types.CallbackQuery):
-    booking_id = int(callback.data.split("_")[1])
+    try:
+        booking_id = int(callback.data.split("_")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
 
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT user_id, service, date, time FROM bookings WHERE id = %s", (booking_id,))
-    booking = cur.fetchone()
+    cur.execute(
+        """
+        UPDATE bookings
+        SET status = 'cancelled'
+        WHERE id = %s AND user_id = %s AND status = 'confirmed'
+        RETURNING user_id, service, date, time
+        """,
+        (booking_id, callback.from_user.id)
+    )
+    cancelled_booking = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    if booking:
-        user_id, service, date_str, time_str = booking
-        cur.execute("UPDATE bookings SET status = 'cancelled' WHERE id = %s", (booking_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
+    if not cancelled_booking:
+        await callback.answer(
+            "❌ Не удалось отменить запись: она не найдена, уже отменена или принадлежит другому пользователю.",
+            show_alert=True
+        )
+        return
 
-        await callback.message.edit_text(f"❌ Запись на {date_str} в {time_str} успешно отменена.")
-        await callback.answer("Запись отменена.")
+    user_id, service, date_str, time_str = cancelled_booking
 
-        try:
-            admin_text = (
-                f"⚠️ **ЗАПИСЬ ОТМЕНЕНА!**\n"
-                f"👤 Клиент ID: `{user_id}`\n"
-                f"✂️ Услуга: {service}\n"
-                f"📅 Дата: {date_str}\n"
-                f"🕒 Время: {time_str}\n"
-                f"❌ Статус: Отменено"
-            )
-            await bot.send_message(ADMIN_ID, admin_text, parse_mode="Markdown")
-        except Exception as e:
-            logging.error(f"Не удалось отправить уведомление админу: {e}")
-    else:
-        cur.close()
-        conn.close()
-        await callback.answer("Запись не найдена.")
+    await callback.message.edit_text(f"❌ Запись на {date_str} в {time_str} успешно отменена.")
+    await callback.answer("Запись отменена.")
+
+    try:
+        admin_text = (
+            f"⚠️ **ЗАПИСЬ ОТМЕНЕНА!**\n"
+            f"👤 Клиент ID: `{user_id}`\n"
+            f"✂️ Услуга: {service}\n"
+            f"📅 Дата: {date_str}\n"
+            f"🕒 Время: {time_str}\n"
+            f"❌ Статус: Отменено"
+        )
+        await bot.send_message(ADMIN_ID, admin_text, parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Не удалось отправить уведомление админу: {e}")
 
 @dp.message(F.text == "💇‍♂️ Записаться")
 async def cmd_book(message: types.Message, state: FSMContext):
