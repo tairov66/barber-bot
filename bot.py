@@ -1324,6 +1324,144 @@ async def process_phone(message: types.Message, state: FSMContext):
     await state.clear()
 
 
+
+
+# --- Панель владельца: только чтение данных и существующие действия ---
+ADMIN_PAGE_SIZE = 8
+
+
+def admin_panel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Записи на сегодня", callback_data="panel_today_0")],
+        [InlineKeyboardButton(text="⏳ Ожидают решения", callback_data="panel_pending_0")],
+        [InlineKeyboardButton(text="📋 Ближайшие записи", callback_data="panel_upcoming_0")],
+        [InlineKeyboardButton(text="📞 Обратные звонки", callback_data="panel_calls_0")],
+    ])
+
+
+def admin_back_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 В админ-меню", callback_data="panel_home")]
+    ])
+
+
+@dp.message(Command("admin"))
+async def cmd_admin_panel(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Нет доступа.")
+        return
+    await message.answer("💈 Админ-панель\nВыберите раздел:", reply_markup=admin_panel_keyboard())
+
+
+@dp.callback_query(F.data == "panel_home")
+async def panel_home(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Нет доступа.", show_alert=True)
+        return
+    await callback.message.edit_text("💈 Админ-панель\nВыберите раздел:", reply_markup=admin_panel_keyboard())
+    await callback.answer()
+
+
+def _panel_sort_key(row):
+    day = parse_date_str(row[4])
+    ok, minutes, _ = parse_user_time(row[5] or "")
+    return (day or datetime.max.date(), minutes if ok else 9999, row[0])
+
+
+@dp.callback_query(F.data.startswith("panel_"))
+async def panel_section(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Нет доступа.", show_alert=True)
+        return
+    parts = (callback.data or "").split("_")
+    if len(parts) != 3 or parts[1] not in {"today", "pending", "upcoming", "calls"}:
+        await callback.answer("Неизвестный раздел.", show_alert=True)
+        return
+    section = parts[1]
+    try:
+        page = int(parts[2])
+        if not 0 <= page <= 10000:
+            raise ValueError()
+    except ValueError:
+        await callback.answer("Неверная страница.", show_alert=True)
+        return
+
+    now = datetime.now(BISHKEK_TZ)
+    today = now.date()
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if section == "calls":
+                cur.execute("""SELECT id, user_name, phone, service, desired_date, desired_time, status
+                               FROM callback_requests WHERE status = 'pending_callback' ORDER BY id DESC LIMIT 500""")
+                rows = cur.fetchall()
+            else:
+                cur.execute("""SELECT id, user_name, phone, service, date, time, status
+                               FROM bookings WHERE status IN ('pending', 'confirmed') ORDER BY id DESC LIMIT 2000""")
+                rows = cur.fetchall()
+    except Exception:
+        logging.exception("Ошибка чтения админ-панели")
+        await callback.answer("Ошибка базы данных. Попробуйте позже.", show_alert=True)
+        return
+    finally:
+        if conn:
+            conn.close()
+
+    if section == "today":
+        rows = [r for r in rows if parse_date_str(r[4]) == today]
+        title = "📅 Записи на сегодня"
+    elif section == "pending":
+        rows = [r for r in rows if r[6] == "pending" and (parse_date_str(r[4]) or datetime.min.date()) >= today]
+        title = "⏳ Ожидают решения"
+    elif section == "upcoming":
+        rows = [r for r in rows if r[6] == "confirmed" and (parse_date_str(r[4]) or datetime.min.date()) >= today and
+                (parse_date_str(r[4]) > today or (parse_user_time(r[5] or "")[1] or 0) >= now.hour * 60 + now.minute)]
+        title = "📋 Ближайшие записи"
+    else:
+        title = "📞 Обратные звонки"
+
+    if section != "calls":
+        rows.sort(key=_panel_sort_key)
+    total = len(rows)
+    start = page * ADMIN_PAGE_SIZE
+    if start >= total and page > 0:
+        await callback.answer("Больше записей нет.", show_alert=True)
+        return
+    selected = rows[start:start + ADMIN_PAGE_SIZE]
+    lines = [f"{title} ({total})", f"Страница {page + 1} из {max(1, (total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)}"]
+    buttons = []
+    for r in selected:
+        row_id, name, phone, service, date_str, time_str, status = r
+        lines.append(f"\n№{row_id} | {date_str}, {time_str}\n👤 {name or 'Клиент'} | 📞 {phone or 'нет номера'}\n✂️ {service} | {status}")
+        if section == "pending":
+            buttons.append([
+                InlineKeyboardButton(text=f"✅ №{row_id}", callback_data=f"admin_approve_{row_id}"),
+                InlineKeyboardButton(text=f"❌ №{row_id}", callback_data=f"admin_reject_{row_id}")
+            ])
+        elif section == "calls":
+            buttons.append([
+                InlineKeyboardButton(text=f"📞 Связался №{row_id}", callback_data=f"cb_contacted_{row_id}"),
+                InlineKeyboardButton(text=f"❌ Закрыть №{row_id}", callback_data=f"cb_close_{row_id}")
+            ])
+    if not selected:
+        lines.append("\nПока записей нет.")
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"panel_{section}_{page - 1}"))
+    if start + ADMIN_PAGE_SIZE < total:
+        navigation.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"panel_{section}_{page + 1}"))
+    if navigation:
+        buttons.append(navigation)
+    buttons.append([InlineKeyboardButton(text="🔙 В админ-меню", callback_data="panel_home")])
+    # Ограничение Telegram 4096 символов; размер страницы небольшой, но поля могут быть длинными.
+    output = "\n".join(lines)
+    if len(output) > 3900:
+        output = output[:3890] + "…"
+    await callback.message.edit_text(output, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
 async def main():
     init_db()
     await dp.start_polling(bot)
